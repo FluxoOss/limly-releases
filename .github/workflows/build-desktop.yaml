@@ -1,0 +1,422 @@
+name: build-desktop
+run-name: Limly ${{ inputs.version }} (${{ inputs.ref }})
+
+# Windows and Linux installers for Limly, built from the private FluxoOss/Limly
+# source. Copy this file to .github/workflows/build-desktop.yaml in the public
+# FluxoOss/limly-releases repository, which holds no source code: every run
+# checks out the commit it is given with a read-only deploy key and uploads
+# only the installers. desktop_release_macos, on Pierre's Mac, starts the run,
+# signs the installers for the updater with the key in its keychain and
+# publishes them next to the macOS build.
+#
+# Setup in FluxoOss/limly-releases:
+#   - Secret LIMLY_SOURCE_DEPLOY_KEY: private half of a read-only deploy key of
+#     FluxoOss/Limly.
+#   - Optional variables AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID,
+#     AZURE_ARTIFACT_SIGNING_ENDPOINT, AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME and
+#     AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME turn on Authenticode
+#     signing of the Windows build; without them the installer is unsigned.
+#
+# Logs and run artifacts of a public repository are public. Rust warnings are
+# capped so they never print source lines, but a failing build still shows the
+# code it failed on.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "FluxoOss/Limly commit SHA to build"
+        required: true
+        type: string
+      version:
+        description: "Version, e.g. 1.0.5"
+        required: true
+        type: string
+      build_env:
+        description: "JSON with the public build values: POSTHOG_API_KEY, VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY, VITE_APP_URL, VITE_API_URL, LIMLY_API_HOST"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-desktop-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  APP_VERSION: ${{ inputs.version }}
+  SOURCE_REF: ${{ inputs.ref }}
+  BUILD_ENV: ${{ inputs.build_env }}
+  TAURI_CONF_PATH: ./src-tauri/tauri.conf.stable.json
+  # The updater signatures are made on Pierre's Mac, so the key never comes
+  # here. A file rather than inline JSON: pnpm runs the tauri script through
+  # cmd.exe on Windows, which mangles quoted arguments.
+  NO_UPDATER_CONF_PATH: ./src-tauri/tauri.conf.no-updater.json
+  NODE_OPTIONS: --max-old-space-size=4096
+  CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+  CARGO_TERM_COLOR: never
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check inputs
+        run: |
+          if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must look like 1.2.3"
+            exit 1
+          fi
+          if [[ ! "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::ref must be a full commit SHA"
+            exit 1
+          fi
+          if ! jq -e '.POSTHOG_API_KEY | startswith("phc_")' <<< "$BUILD_ENV" > /dev/null; then
+            echo "::error::build_env needs a phc_ POSTHOG_API_KEY"
+            exit 1
+          fi
+          for key in VITE_SUPABASE_URL VITE_SUPABASE_ANON_KEY VITE_APP_URL VITE_API_URL; do
+            if ! jq -e --arg key "$key" '.[$key] | type == "string" and test("^[[:print:]]+$")' <<< "$BUILD_ENV" > /dev/null; then
+              echo "::error::build_env needs a one-line $key"
+              exit 1
+            fi
+          done
+
+  linux:
+    needs: check
+    name: linux-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            debian_arch: amd64
+            file_arch: x86-64
+            docker_platform: linux/amd64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            debian_arch: arm64
+            file_arch: ARM aarch64
+            docker_platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: --cap-lints allow
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: --cap-lints allow
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: FluxoOss/Limly
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.LIMLY_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Set the version and skip updater artifacts
+        run: |
+          ./scripts/version.sh ./apps/desktop/src-tauri/tauri.conf.json "$APP_VERSION"
+          printf '%s\n' '{"bundle":{"createUpdaterArtifacts":false}}' > "apps/desktop/$NO_UPDATER_CONF_PATH"
+
+      # ./ on purpose: the composite actions come from the FluxoOss/Limly
+      # checkout in the workspace, which $/ (this repository) does not have.
+      - uses: ./.github/actions/install_desktop_deps # zizmor: ignore[self-repository]
+        with:
+          target: linux
+
+      - name: Install Rust
+        run: |
+          channel=$(grep 'channel' rust-toolchain.toml | cut -d'"' -f2)
+          rustup toolchain install "$channel" --profile minimal \
+            --component rust-analyzer,rustfmt,clippy --target "$TARGET" --no-self-update
+
+      - uses: ./.github/actions/pnpm_install # zizmor: ignore[self-repository]
+
+      - run: pnpm -F ui build
+
+      - name: Build sidecars
+        run: |
+          TAURI_ENV_TARGET_TRIPLE="$TARGET" cargo xtask prepare-binaries
+          ./scripts/sidecar.sh "./apps/desktop/$TAURI_CONF_PATH" "binaries/char-chrome-native-host"
+          ./scripts/sidecar.sh "./apps/desktop/$TAURI_CONF_PATH" "resources/cli/limly-cli"
+
+      - name: Build AppImage and deb
+        env:
+          POSTHOG_API_KEY: ${{ fromJSON(inputs.build_env).POSTHOG_API_KEY }}
+          VITE_POSTHOG_API_KEY: ${{ fromJSON(inputs.build_env).POSTHOG_API_KEY }}
+          VITE_SUPABASE_URL: ${{ fromJSON(inputs.build_env).VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ fromJSON(inputs.build_env).VITE_SUPABASE_ANON_KEY }}
+          VITE_APP_URL: ${{ fromJSON(inputs.build_env).VITE_APP_URL }}
+          VITE_API_URL: ${{ fromJSON(inputs.build_env).VITE_API_URL }}
+          LIMLY_API_HOST: ${{ fromJSON(inputs.build_env).LIMLY_API_HOST }}
+          VITE_APP_VERSION: ${{ inputs.version }}
+        run: |
+          pnpm -F desktop tauri build --ci \
+            --bundles appimage,deb \
+            --target "$TARGET" \
+            --config "$TAURI_CONF_PATH" \
+            --config "$NO_UPDATER_CONF_PATH"
+
+      - name: Repack AppImage
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: node scripts/repack-linux-appimage.mjs "apps/desktop/src-tauri/target/$TARGET/release/bundle/appimage" --no-sign
+
+      - name: Check the packages
+        env:
+          DEBIAN_ARCH: ${{ matrix.debian_arch }}
+          FILE_ARCH: ${{ matrix.file_arch }}
+        run: |
+          shopt -s nullglob
+          bundle_dir="apps/desktop/src-tauri/target/$TARGET/release/bundle"
+          appimages=("$bundle_dir"/appimage/*.AppImage)
+          debs=("$bundle_dir"/deb/*.deb)
+          if [[ ${#appimages[@]} -ne 1 || ${#debs[@]} -ne 1 ]]; then
+            echo "::error::Expected one AppImage and one .deb for $TARGET"
+            exit 1
+          fi
+          package_arch=$(dpkg-deb --field "${debs[0]}" Architecture)
+          if [[ "$package_arch" != "$DEBIAN_ARCH" ]]; then
+            echo "::error::Expected Debian architecture $DEBIAN_ARCH, got $package_arch"
+            exit 1
+          fi
+          package_version=$(dpkg-deb --field "${debs[0]}" Version)
+          if [[ "$package_version" != "$APP_VERSION" ]]; then
+            echo "::error::Expected Debian version $APP_VERSION, got $package_version"
+            exit 1
+          fi
+          if [[ "$(basename "${appimages[0]}")" != *"$APP_VERSION"* ]]; then
+            echo "::error::AppImage filename does not contain version $APP_VERSION"
+            exit 1
+          fi
+          if ! file "${appimages[0]}" | grep -Fq "$FILE_ARCH"; then
+            echo "::error::AppImage architecture does not match $TARGET"
+            exit 1
+          fi
+          cli_package="$RUNNER_TEMP/limly-cli-package"
+          dpkg-deb --extract "${debs[0]}" "$cli_package"
+          python3 scripts/verify-packaged-cli.py "$cli_package" "$package_version"
+
+      - name: Start the app from the deb in a clean Ubuntu
+        env:
+          DOCKER_PLATFORM: ${{ matrix.docker_platform }}
+        run: |
+          deb=$(find "apps/desktop/src-tauri/target/$TARGET/release/bundle/deb" -maxdepth 1 -name '*.deb' -type f -print -quit)
+          docker run --rm \
+            --platform "$DOCKER_PLATFORM" \
+            --volume "$PWD:/workspace:ro" \
+            --env DEB_PATH="/workspace/$deb" \
+            --env LIMLY_DISABLE_SENTRY=1 \
+            --env RUST_BACKTRACE=1 \
+            ubuntu:24.04 \
+            bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y "$DEB_PATH" dbus-x11 xvfb
+              set +e
+              timeout --signal=TERM 20s xvfb-run -a dbus-run-session -- /usr/bin/limly > /tmp/limly.log 2>&1
+              status=$?
+              set -e
+              cat /tmp/limly.log
+              if [[ $status -ne 124 ]]; then
+                echo "Limly exited before the smoke timeout with status $status"
+                exit 1
+              fi
+            '
+
+      - name: Collect installers
+        run: |
+          mkdir -p installers
+          bundle_dir="apps/desktop/src-tauri/target/$TARGET/release/bundle"
+          cp "$bundle_dir"/appimage/*.AppImage "$bundle_dir"/deb/*.deb installers/
+          (cd installers && for file in *; do sha256sum "$file" > "$file.sha256"; done)
+          ls -l installers
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: installers/*
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    needs: check
+    runs-on: windows-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      # Joined with the -crt-static flag from the repository's .cargo/config.toml.
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: --cap-lints allow
+      AZURE_SIGNING: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME != '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: FluxoOss/Limly
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.LIMLY_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Set the version and skip updater artifacts
+        run: |
+          ./scripts/version.sh ./apps/desktop/src-tauri/tauri.conf.json "$APP_VERSION"
+          printf '%s\n' '{"bundle":{"createUpdaterArtifacts":false}}' > "apps/desktop/$NO_UPDATER_CONF_PATH"
+
+      - name: Install Rust
+        run: |
+          channel=$(grep 'channel' rust-toolchain.toml | cut -d'"' -f2)
+          rustup toolchain install "$channel" --profile minimal \
+            --component rust-analyzer,rustfmt,clippy --target "$TARGET" --no-self-update
+
+      - uses: ./.github/actions/pnpm_install # zizmor: ignore[self-repository]
+
+      - run: pnpm -F ui build
+
+      - name: Build the CLI sidecar
+        run: |
+          cargo build --locked --release -p limly-cli --target "$TARGET"
+          cp "target/$TARGET/release/limly.exe" "apps/desktop/src-tauri/resources/cli/limly-cli-$TARGET.exe"
+          ./scripts/sidecar.sh "./apps/desktop/$TAURI_CONF_PATH" resources/cli/limly-cli
+
+      - name: Build the app
+        env:
+          POSTHOG_API_KEY: ${{ fromJSON(inputs.build_env).POSTHOG_API_KEY }}
+          VITE_POSTHOG_API_KEY: ${{ fromJSON(inputs.build_env).POSTHOG_API_KEY }}
+          VITE_SUPABASE_URL: ${{ fromJSON(inputs.build_env).VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ fromJSON(inputs.build_env).VITE_SUPABASE_ANON_KEY }}
+          VITE_APP_URL: ${{ fromJSON(inputs.build_env).VITE_APP_URL }}
+          VITE_API_URL: ${{ fromJSON(inputs.build_env).VITE_API_URL }}
+          LIMLY_API_HOST: ${{ fromJSON(inputs.build_env).LIMLY_API_HOST }}
+          VITE_APP_VERSION: ${{ inputs.version }}
+        run: |
+          pnpm -F desktop tauri build --ci \
+            --target "$TARGET" \
+            --config "$TAURI_CONF_PATH" \
+            --config "$NO_UPDATER_CONF_PATH" \
+            --no-bundle --no-sign
+
+      - if: env.AZURE_SIGNING == 'true'
+        name: Sign in to Azure
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - if: env.AZURE_SIGNING == 'true'
+        name: Sign the app and CLI binaries
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files: |
+            ${{ github.workspace }}\apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\limly.exe
+            ${{ github.workspace }}\apps\desktop\src-tauri\resources\cli\limly-cli-x86_64-pc-windows-msvc.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Bundle the installer
+        run: |
+          pnpm -F desktop tauri bundle --ci \
+            --bundles nsis \
+            --target "$TARGET" \
+            --config "$TAURI_CONF_PATH" \
+            --config "$NO_UPDATER_CONF_PATH" \
+            --no-sign
+
+      - id: installer
+        name: Locate the installer
+        shell: pwsh
+        run: |
+          $bundleDir = "apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          $installers = @(Get-ChildItem $bundleDir -Filter "*.exe")
+          if ($installers.Count -ne 1) {
+            throw "Expected one NSIS installer in $bundleDir, found $($installers.Count)"
+          }
+          if ($installers[0].Name -notmatch [regex]::Escape($env:APP_VERSION)) {
+            throw "Installer filename does not contain version $env:APP_VERSION"
+          }
+          "path=$($installers[0].FullName)" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - if: env.AZURE_SIGNING == 'true'
+        name: Sign the installer
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files: ${{ steps.installer.outputs.path }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - if: env.AZURE_SIGNING == 'true'
+        name: Check the Authenticode signatures
+        shell: pwsh
+        env:
+          INSTALLER_PATH: ${{ steps.installer.outputs.path }}
+        run: |
+          $files = @(
+            "apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/limly.exe",
+            "apps/desktop/src-tauri/resources/cli/limly-cli-x86_64-pc-windows-msvc.exe",
+            $env:INSTALLER_PATH
+          )
+          foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature $file
+            if ($signature.Status -ne "Valid" -or -not $signature.TimeStamperCertificate) {
+              throw "Invalid or untimestamped Authenticode signature for $file`: $($signature.Status)"
+            }
+          }
+
+      - name: Install it silently and check the bundled CLI
+        shell: pwsh
+        env:
+          INSTALLER_PATH: ${{ steps.installer.outputs.path }}
+        run: |
+          $installRoot = Join-Path $env:RUNNER_TEMP "limly-install"
+          $installation = Start-Process -FilePath $env:INSTALLER_PATH `
+            -ArgumentList @("/S", "/D=$installRoot") -PassThru
+          if (-not $installation.WaitForExit(120000)) {
+            $installation.Kill()
+            throw "Windows installation timed out"
+          }
+          if ($installation.ExitCode -ne 0) {
+            throw "Windows installation failed: $($installation.ExitCode)"
+          }
+          python scripts/verify-packaged-cli.py $installRoot $env:APP_VERSION
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged Windows CLI verification failed"
+          }
+
+      - name: Collect the installer
+        shell: pwsh
+        env:
+          INSTALLER_PATH: ${{ steps.installer.outputs.path }}
+        run: |
+          New-Item -ItemType Directory -Force -Path installers | Out-Null
+          $installer = Get-Item $env:INSTALLER_PATH
+          Copy-Item $installer.FullName installers/
+          $hash = (Get-FileHash -Algorithm SHA256 $installer.FullName).Hash.ToLowerInvariant()
+          "$hash  $($installer.Name)" |
+            Out-File "installers/$($installer.Name).sha256" -Encoding ascii -NoNewline
+          Get-ChildItem installers
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-x86_64
+          path: installers/*
+          if-no-files-found: error
+          retention-days: 7
