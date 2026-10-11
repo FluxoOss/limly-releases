@@ -54,7 +54,9 @@ env:
   # cmd.exe on Windows, which mangles quoted arguments.
   NO_UPDATER_CONF_PATH: ./src-tauri/tauri.conf.no-updater.json
   NODE_OPTIONS: --max-old-space-size=4096
-  CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+  # No CARGO_PROFILE_RELEASE_DEBUG=line-tables-only (upstream keeps it for
+  # Sentry symbols): on Linux the tables stay inside the binary and bloat the
+  # AppImage and deb.
   CARGO_TERM_COLOR: never
 
 jobs:
