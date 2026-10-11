@@ -1,0 +1,106 @@
+name: attach-installers
+run-name: Attach the ${{ inputs.tag }} installers from run ${{ inputs.build_run_id }}
+
+# Uploads the Windows and Linux installers of a build-desktop run, plus their
+# checksums and the stable names the website links to, to the draft release
+# they belong to. Copy this file to .github/workflows/attach-installers.yaml in
+# FluxoOss/limly-releases next to build-desktop.yaml.
+#
+# Uploads from Pierre's Mac to GitHub's release endpoint have crawled at about
+# 80 KB/s per connection, so the installers go from GitHub's artifact storage
+# to the release here instead. Their updater signatures and latest.json are
+# made on the Mac and uploaded from there.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "build-desktop run whose installers to attach"
+        required: true
+        type: string
+      tag:
+        description: "Draft release tag, e.g. v1.0.5"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: attach-installers-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  attach:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check inputs
+        run: |
+          if [[ ! "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::build_run_id must be a run number"
+            exit 1
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag must look like v1.2.3"
+            exit 1
+          fi
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]]; then
+            echo "::error::$TAG is not a draft release"
+            exit 1
+          fi
+          run=$(gh run view "$BUILD_RUN_ID" --json workflowName,conclusion,displayTitle \
+            --jq '"\(.workflowName)|\(.conclusion)|\(.displayTitle)"')
+          if [[ "$run" != "build-desktop|success|Limly ${TAG#v} ("* ]]; then
+            echo "::error::Run $BUILD_RUN_ID is not a successful build-desktop run of ${TAG#v}: $run"
+            exit 1
+          fi
+
+      - name: Download the installers
+        run: |
+          gh run download "$BUILD_RUN_ID" --dir installers
+          for checksum in installers/*/*.sha256; do
+            (cd "$(dirname "$checksum")" && sha256sum -c "$(basename "$checksum")")
+          done
+
+      - name: Attach them to the draft release
+        run: |
+          shopt -s nullglob
+          mkdir -p stable
+          # artifact, extension, stable name the website links to
+          entries=(
+            "windows-x86_64 exe Limly-windows-x64-setup.exe"
+            "linux-x86_64 AppImage Limly-linux-x86_64.AppImage"
+            "linux-x86_64 deb Limly-linux-x86_64.deb"
+            "linux-aarch64 AppImage Limly-linux-arm64.AppImage"
+            "linux-aarch64 deb Limly-linux-arm64.deb"
+          )
+          files=()
+          for entry in "${entries[@]}"; do
+            read -r artifact extension stable_name <<< "$entry"
+            matches=(installers/"$artifact"/*."$extension")
+            if [[ ${#matches[@]} -ne 1 || "${matches[0]}" != *"_${TAG#v}_"* ]]; then
+              echo "::error::Expected one ${TAG#v} .$extension in $artifact, found ${#matches[@]}"
+              exit 1
+            fi
+            cp "${matches[0]}" "stable/$stable_name"
+            files+=("${matches[0]}" "${matches[0]}.sha256" "stable/$stable_name")
+          done
+          for file in "${files[@]}"; do
+            for attempt in 1 2 3; do
+              gh release upload "$TAG" "$file" --clobber && break
+              if [[ $attempt -eq 3 ]]; then
+                echo "::error::Could not upload $(basename "$file")"
+                exit 1
+              fi
+              sleep 15
+            done
+          done
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size)"'
